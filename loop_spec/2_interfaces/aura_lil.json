@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop.os/schemas/aura_lil.json",
+  "title": "Loop Intent Language (LIL) Schema",
+  "description": "JSON schema for Aura AI assistant intents in Loop OS. The Capability Broker mediates all resource access; required_capabilities never leaves the broker's trust domain.",
+  "type": "object",
+  "required": ["intent", "params", "required_capabilities"],
+  "properties": {
+    "intent": {
+      "type": "string",
+      "description": "The action the user wants to perform",
+      "enum": [
+        "open",
+        "compose", 
+        "search",
+        "move",
+        "copy",
+        "delete",
+        "send",
+        "schedule",
+        "query",
+        "configure",
+        "install",
+        "uninstall"
+      ]
+    },
+    "params": {
+      "type": "object",
+      "description": "Parameters specific to each intent. Validation per intent handled by broker logic. Typical fields by intent: open -> {target: string, app_id?: string}, compose -> {type: string, content: string}, search -> {query: string, scope?: string}, move -> {source: string, destination: string}, copy -> {source: string, destination: string}, delete -> {target: string}, send -> {to: string[], subject?: string, body?: string, attachments?: string[], schedule?: string}, schedule -> {title: string, start: string, end?: string, calendar_id?: string}, query -> {question: string, source?: string}, configure -> {setting: string, value: any}, install -> {app_id: string, source?: string}, uninstall -> {app_id: string}",
+      "additionalProperties": true,
+      "properties": {}
+    },
+    "required_capabilities": {
+      "type": "array",
+      "description": "List of capability declarations Aura must possess for intent authorization. The broker verifies these capabilities before mediation.",
+      "items": {
+        "type": "object",
+        "required": ["type", "identifier"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Capability type that Aura must hold",
+            "enum": [
+              "app:launch",
+              "calendar:read",
+              "calendar:write",
+              "clipboard:read",
+              "clipboard:write",
+              "contacts:read",
+              "contacts:write",
+              "device:camera",
+              "device:microphone",
+              "device:speaker",
+              "fs:execute",
+              "fs:read",
+              "fs:write",
+              "location:coarse",
+              "location:precise",
+              "net:inbound",
+              "net:outbound",
+              "orchestrate"
+            ]
+          },
+          "identifier": {
+            "type": "string",
+            "description": "Scoped identifier for the resource. For filesystem: path; for network: domain; for app: app_id. For contacts, calendar: the filter string or calendar ID (use '*' or 'all' for unrestricted). For location, clipboard, device, and orchestrate: use an empty string. Must be empty string for types that do not require scoping."
+          }
+        },
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "confirmation_required": {
+      "type": "boolean",
+      "description": "If true, Aura must ask user for explicit confirmation before broker executes the intent. Should be true for destructive or sensitive actions.",
+      "default": false
+    },
+    "context": {
+      "type": "object",
+      "description": "Extra contextual information that might help the broker or Aura's logging, like natural language echo, session id, etc. Not required for execution.",
+      "additionalProperties": true,
+      "properties": {}
+    }
+  },
+  "additionalProperties": false
+}

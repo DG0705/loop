@@ -1,0 +1,194 @@
+syntax = "proto3";
+
+package loop.capability;
+
+// Capability Broker service for Loop OS capability-security model
+// Manages all resource access tokens in the system
+
+// CapToken represents an opaque, unforgeable capability token
+message CapToken {
+  uint64 id = 1;                    // Unique numeric identifier
+  string description = 2;            // Human-readable description
+  string compartment = 3;            // Owner compartment identifier
+  bool delegatable = 4;              // Whether this token can be delegated
+  uint64 parent_id = 5;             // Parent token ID for delegation tracking
+}
+
+// ResourceSpec defines different types of resources that can be accessed
+message ResourceSpec {
+  oneof resource {
+    FilesystemResource filesystem = 1;
+    NetworkResource network = 2;
+    DeviceResource device = 3;
+    AppResource app = 4;
+    OrchestrateResource orchestrate = 5;
+    ContactsResource contacts = 6;
+    CalendarResource calendar = 7;
+    ClipboardResource clipboard = 8;
+    LocationResource location = 9;
+  }
+}
+
+// Filesystem access resource
+message FilesystemResource {
+  string path = 1;                  // Filesystem path
+  bool read = 2;                    // Read permission
+  bool write = 3;                   // Write permission
+  bool execute = 4;                 // Execute permission
+  bool delegatable = 5;             // Can be delegated
+}
+
+// Network access resource
+message NetworkResource {
+  enum Protocol {
+    TCP = 0;
+    UDP = 1;
+  }
+  enum Direction {
+    INBOUND = 0;
+    OUTBOUND = 1;
+  }
+  
+  Protocol protocol = 1;            // TCP or UDP
+  string domain_filter = 2;         // Domain filter (regex or exact match)
+  uint32 port = 3;                  // Port number
+  Direction direction = 4;          // Inbound or outbound
+  bool delegatable = 5;             // Can be delegated
+}
+
+// Device access resource
+message DeviceResource {
+  enum DeviceType {
+    CAMERA = 0;
+    MICROPHONE = 1;
+    SPEAKER = 2;
+  }
+  
+  DeviceType device_type = 1;       // Type of device
+  bool delegatable = 2;             // Can be delegated
+}
+
+// App launch permission resource
+message AppResource {
+  enum Universe {
+    LINUX = 0;
+    WINDOWS = 1;
+    ANDROID = 2;
+    NATIVE = 3;
+  }
+  
+  Universe universe = 1;            // Target universe
+  string app_id = 2;                // Application identifier
+  bool delegatable = 3;             // Can be delegated
+}
+
+// Orchestrate capability - special token for Aura AI assistant
+message OrchestrateResource {
+  bool can_chain = 1;               // Can chain and delegate other capabilities
+}
+
+// Contacts access resource
+message ContactsResource {
+  bool read = 1;                    // Read contacts
+  bool write = 2;                   // Create/edit contacts
+  bool delegatable = 3;             // Can be delegated
+  string filter = 4;                // Optional filter (e.g., "all" or "friends")
+}
+
+// Calendar access resource
+message CalendarResource {
+  bool read = 1;                    // View events
+  bool write = 2;                   // Create/modify events
+  bool delegatable = 3;             // Can be delegated
+  string calendar_id = 4;           // Optional calendar ID (e.g., "personal", "work", "all")
+}
+
+// Clipboard access resource
+message ClipboardResource {
+  bool read = 1;                    // Read clipboard content
+  bool write = 2;                   // Write new content
+  bool delegatable = 3;             // Can be delegated
+}
+
+// Location access resource
+message LocationResource {
+  bool precise = 1;                 // Precise (GPS) vs coarse (city-level) location
+  bool delegatable = 2;             // Can be delegated
+}
+
+// Request/Response messages for CapabilityBroker service
+
+message CreateCapabilityRequest {
+  ResourceSpec resource_spec = 1;   // Resource specification
+  string compartment = 2;            // Target compartment
+  string requestor_compartment = 3; // Who is requesting this capability
+}
+
+message CreateCapabilityResponse {
+  CapToken token = 1;               // Created capability token
+  bool success = 2;                 // Operation success
+  string error_message = 3;         // Error message if failed
+}
+
+message RevokeCapabilityRequest {
+  uint64 token_id = 1;              // Token ID to revoke
+  string requestor_compartment = 2; // Who is requesting revocation
+}
+
+message RevokeCapabilityResponse {
+  bool success = 1;                 // Operation success
+  string error_message = 2;         // Error message if failed
+  uint32 revoked_count = 3;          // Number of tokens revoked (including derived)
+}
+
+message DelegateCapabilityRequest {
+  uint64 token_id = 1;              // Token ID to delegate
+  string target_compartment = 2;     // Target compartment
+  string delegator_compartment = 3;  // Who is delegating
+  uint64 orchestrate_token_id = 4;  // Orchestrate token ID (required for Aura)
+}
+
+message DelegateCapabilityResponse {
+  CapToken delegated_token = 1;      // New delegated token
+  bool success = 2;                 // Operation success
+  string error_message = 3;         // Error message if failed
+}
+
+message InspectCompartmentRequest {
+  string compartment = 1;            // Compartment to inspect
+  string requestor_compartment = 2; // Who is requesting inspection
+}
+
+message InspectCompartmentResponse {
+  repeated CapToken capabilities = 1; // All capabilities held by compartment
+  bool success = 2;                 // Operation success
+  string error_message = 3;         // Error message if failed
+}
+
+message ListCapabilitiesRequest {
+  string requestor_compartment = 1; // Who is requesting the list
+}
+
+message ListCapabilitiesResponse {
+  repeated CapToken capabilities = 1; // All active capabilities in system
+  bool success = 2;                 // Operation success
+  string error_message = 3;         // Error message if failed
+}
+
+// CapabilityBroker service definition
+service CapabilityBroker {
+  // Create a new capability from a resource spec for a given compartment
+  rpc CreateCapability(CreateCapabilityRequest) returns (CreateCapabilityResponse);
+  
+  // Revoke a capability by its id, recursively removing derived tokens
+  rpc RevokeCapability(RevokeCapabilityRequest) returns (RevokeCapabilityResponse);
+  
+  // Delegate a capability token to another compartment
+  rpc DelegateCapability(DelegateCapabilityRequest) returns (DelegateCapabilityResponse);
+  
+  // List all capabilities held by a specific compartment
+  rpc InspectCompartment(InspectCompartmentRequest) returns (InspectCompartmentResponse);
+  
+  // List all active capabilities in the system for user dashboard
+  rpc ListCapabilities(ListCapabilitiesRequest) returns (ListCapabilitiesResponse);
+}
