@@ -1,0 +1,724 @@
+//! Loop Core Interface Language (RIL)
+//! 
+//! This specification defines the safe, type-level contract between user-space services
+//! and the seL4 microkernel. All interfaces are designed to preserve the kernel's formal
+//! verification properties while providing Rust's memory safety guarantees.
+//! 
+//! # Design Principles
+//! 
+//! - **Capability Safety**: All capabilities are wrapped in zero-sized types that cannot be forged
+//! - **No Raw Handles**: Capability pointers never escape unsafe blocks
+//! - **Type State**: Access rights are encoded in the type system using PhantomData
+//! - **Ownership**: Rust's ownership model maps directly to seL4's capability ownership
+//! - **No Root**: There is no privileged user; all access is capability-based
+
+#![no_std]
+
+use core::marker::PhantomData;
+use core::ptr::NonNull;
+
+// =============================================================================
+// CAPABILITY TYPE SYSTEM
+// =============================================================================
+
+/// Access rights markers for capabilities
+pub mod rights {
+    use super::PhantomData;
+    
+    /// Read access right
+    pub struct Read;
+    /// Write access right  
+    pub struct Write;
+    /// Grant access right (can delegate capabilities)
+    pub struct Grant;
+    /// Execute access right (for memory)
+    pub struct Execute;
+    
+    /// Combination of access rights
+    pub trait Rights {}
+    
+    impl Rights for Read {}
+    impl Rights for Write {}
+    impl Rights for Grant {}
+    impl Rights for Execute {}
+    
+    /// Common right combinations
+    pub struct Rw<R: Rights, W: Rights>(PhantomData<(R, W)>);
+    pub struct Rwx<R: Rights, W: Rights, X: Rights>(PhantomData<(R, W, X)>);
+}
+
+/// A capability wrapper that provides type-safe access to seL4 kernel objects
+/// 
+/// This is a zero-sized type that represents a capability reference. The actual
+/// capability handle is stored in the seL4 CSpace and is never exposed as a raw value.
+/// 
+/// # Safety
+/// 
+/// - Capabilities are `!Send` and `!Sync` - they are bound to a thread/address space
+/// - Cannot be cloned or copied without explicit capability operations
+/// - All capabilities must be explicitly deleted using `CapabilityOps::delete` before going out of scope
+#[derive(Debug)]
+pub struct Cap<T: CapType, R: rights::Rights = rights::Read> {
+    _phantom: PhantomData<(T, R)>,
+    // The actual CPtr is stored in seL4's CSpace and managed by the kernel
+    // We never expose it as a raw value
+}
+
+impl<T: CapType, R: rights::Rights> !Send for Cap<T, R> {}
+impl<T: CapType, R: rights::Rights> !Sync for Cap<T, R> {}
+
+/// Marker trait for types that can be represented as seL4 capabilities
+pub trait CapType {
+    /// The seL4 object type identifier
+    const SEL4_TYPE: u32;
+}
+
+// Capability type definitions
+pub mod cap_types {
+    use super::{CapType, Cap};
+    use super::rights;
+    
+    #[derive(Debug)]
+    pub struct CNode;
+    impl CapType for CNode {
+        const SEL4_TYPE: u32 = 0; // seL4_CapTableObject
+    }
+    
+    #[derive(Debug)]
+    pub struct Endpoint;
+    impl CapType for Endpoint {
+        const SEL4_TYPE: u32 = 1; // seL4_EndpointObject
+    }
+    
+    #[derive(Debug)]
+    pub struct Notification;
+    impl CapType for Notification {
+        const SEL4_TYPE: u32 = 2; // seL4_NotificationObject
+    }
+    
+    #[derive(Debug)]
+    pub struct UntypedMemory;
+    impl CapType for UntypedMemory {
+        const SEL4_TYPE: u32 = 3; // seL4_UntypedObject
+    }
+    
+    #[derive(Debug)]
+    pub struct IRQControl;
+    impl CapType for IRQControl {
+        const SEL4_TYPE: u32 = 4; // seL4_IRQControlObject
+    }
+    
+    #[derive(Debug)]
+    pub struct TCB;
+    impl CapType for TCB {
+        const SEL4_TYPE: u32 = 5; // seL4_TCBObject
+    }
+    
+    #[derive(Debug)]
+    pub struct ASIDPool;
+    impl CapType for ASIDPool {
+        const SEL4_TYPE: u32 = 6; // seL4_ASIDPoolObject
+    }
+    
+    #[derive(Debug)]
+    pub struct PageDirectory;
+    impl CapType for PageDirectory {
+        const SEL4_TYPE: u32 = 7; // seL4_PageDirectoryObject
+    }
+    
+    #[derive(Debug)]
+    pub struct PageTable;
+    impl CapType for PageTable {
+        const SEL4_TYPE: u32 = 8; // seL4_PageTableObject
+    }
+    
+    #[derive(Debug)]
+    pub struct Frame;
+    impl CapType for Frame {
+        const SEL4_TYPE: u32 = 9; // seL4_FrameObject
+    }
+}
+
+
+// =============================================================================
+// MESSAGE AND IPC ABSTRACTIONS
+// =============================================================================
+
+/// Virtual address type for memory operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtAddr(pub usize);
+
+/// Physical address type for frame operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysAddr(pub usize);
+
+/// A capability reference that can only be used during IPC operations
+/// 
+/// This type represents a capability that is being transferred via IPC.
+/// It cannot outlive the send/receive operation and cannot be cloned.
+pub struct CapRef<'a, T: CapType> {
+    _phantom: PhantomData<&'a T>,
+    // The actual capability reference is managed by the kernel during IPC
+}
+
+impl<'a, T: CapType> !Send for CapRef<'a, T> {}
+impl<'a, T: CapType> !Sync for CapRef<'a, T> {}
+
+/// Message buffer for seL4 IPC operations
+/// 
+/// seL4 IPC uses hardware registers (Message Registers - MRs) to pass data.
+/// This struct provides a safe interface to those registers.
+#[derive(Debug)]
+pub struct Message {
+    /// Message registers (simplified - actual seL4 has more complex MR layout)
+    mrs: [usize; Self::MAX_MRS],
+    /// Number of valid message registers
+    mr_count: usize,
+    /// Capability references being transferred (only valid during IPC)
+    caps: [*const (); Self::MAX_CAPS],
+    /// Number of capability references
+    cap_count: usize,
+}
+
+impl Message {
+    /// Maximum number of message registers in seL4
+    pub const MAX_MRS: usize = 64;
+    /// Maximum number of capabilities that can be transferred in one message
+    pub const MAX_CAPS: usize = 4;
+    
+    /// Create a new empty message
+    pub fn new() -> Self {
+        Self {
+            mrs: [0; Self::MAX_MRS],
+            mr_count: 0,
+            caps: [core::ptr::null(); Self::MAX_CAPS],
+            cap_count: 0,
+        }
+    }
+    
+    /// Push an integer value into the message
+    /// 
+    /// # Safety
+    /// 
+    /// The caller must ensure the value fits in a usize register
+    pub fn push_int(&mut self, value: usize) -> Result<(), MessageError> {
+        if self.mr_count >= Self::MAX_MRS {
+            return Err(MessageError::Full);
+        }
+        self.mrs[self.mr_count] = value;
+        self.mr_count += 1;
+        Ok(())
+    }
+    
+    /// Get an integer value from the message
+    pub fn get_int(&self, index: usize) -> Result<usize, MessageError> {
+        if index >= self.mr_count {
+            return Err(MessageError::OutOfRange);
+        }
+        Ok(self.mrs[index])
+    }
+    
+    /// Push a capability reference into the message
+    /// 
+    /// # Safety
+    /// 
+    /// The capability reference is only valid during the send/receive operation
+    /// and cannot be used afterwards
+    pub fn push_cap<T: CapType>(&mut self, _cap: &Cap<T>) -> Result<CapRef<'_, T>, MessageError> {
+        if self.cap_count >= Self::MAX_CAPS {
+            return Err(MessageError::Full);
+        }
+        
+        // The actual capability reference is managed by seL4 during IPC
+        // We create a CapRef that ties the lifetime to the message
+        let cap_ref = CapRef {
+            _phantom: PhantomData,
+        };
+        
+        self.cap_count += 1;
+        Ok(cap_ref)
+    }
+    
+    /// Get the number of message registers
+    pub fn mr_count(&self) -> usize {
+        self.mr_count
+    }
+    
+    /// Get the number of capability references
+    pub fn cap_count(&self) -> usize {
+        self.cap_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageError {
+    /// Message buffer is full
+    Full,
+    /// Index out of range
+    OutOfRange,
+    /// Invalid capability reference
+    InvalidCapRef,
+}
+
+// =============================================================================
+// SYSTEM CALL TRAITS
+// =============================================================================
+
+/// Main system call trait that groups all seL4 operations
+/// 
+/// This trait provides the safe interface to seL4 kernel operations.
+/// All unsafe operations are encapsulated within the trait implementations.
+pub trait SystemCall {
+    type CapOps: CapabilityOps;
+    type EndpointOps: EndpointOps;
+    type NotificationOps: NotificationOps;
+    type VSpaceOps: VSpaceOps;
+    type ThreadOps: ThreadOps;
+    type IRQOps: IRQOps;
+    
+    fn cap_ops(&self) -> &Self::CapOps;
+    fn endpoint_ops(&self) -> &Self::EndpointOps;
+    fn notification_ops(&self) -> &Self::NotificationOps;
+    fn vspace_ops(&self) -> &Self::VSpaceOps;
+    fn thread_ops(&self) -> &Self::ThreadOps;
+    fn irq_ops(&self) -> &Self::IRQOps;
+}
+
+/// Capability management operations
+/// 
+/// These operations manipulate seL4 capabilities in a type-safe manner.
+/// All operations respect the capability-based access control model.
+pub trait CapabilityOps {
+    /// Retype untyped memory into a typed capability
+    /// 
+    /// # Safety
+    /// 
+    /// - `from` must have write rights on the CNode
+    /// - `to` must be a valid, untyped capability slot
+    /// - The untyped memory must have sufficient size
+    /// - After this call, the source untyped memory is reduced by the required bytes
+    /// 
+    /// # Arguments
+    /// 
+    /// * `from` - Source untyped memory capability
+    /// * `to` - Destination capability slot (must be untyped)
+    /// * `type_id` - seL4 object type to create
+    /// * `size_bits` - Size of the object (log2)
+    fn retype<T: CapType, U: CapType>(
+        &self,
+        from: &Cap<cap_types::UntypedMemory>,
+        to: &mut Cap<U>,
+        type_id: u32,
+        size_bits: usize,
+    ) -> Result<(), CapError>;
+    
+    /// Delete a capability
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on the CNode containing the capability
+    /// - After deletion, the capability slot becomes untyped
+    /// - Any other references to this capability become invalid
+    /// 
+    /// # CRITICAL: Explicit Deletion Required
+    /// 
+    /// **ALL** kernel-object-backed capabilities (frames, TCBs, endpoints, etc.) **MUST** be
+    /// deleted via this method before the `Cap` goes out of scope. Failure to do so will
+    /// leak kernel resources permanently. The `Cap` type does **NOT** implement automatic
+    /// cleanup via `Drop` - deletion is always explicit to prevent double-free vulnerabilities.
+    fn delete<T: CapType>(&self, cap: Cap<T>) -> Result<(), CapError>;
+    
+    /// Clone a capability
+    /// 
+    /// # Safety
+    /// 
+    /// - `src` must have grant rights
+    /// - `dest` must be a valid, untyped capability slot
+    /// - The caller must have write rights on the destination CNode
+    fn clone_cap<T: CapType>(
+        &self,
+        src: &Cap<T>,
+        dest: &mut Cap<T>,
+    ) -> Result<(), CapError>;
+}
+
+/// Endpoint IPC operations
+/// 
+/// seL4 endpoints provide synchronous message passing between threads.
+/// These operations may block indefinitely.
+pub trait EndpointOps {
+    /// Send a message to an endpoint
+    /// 
+    /// # Safety
+    /// 
+    /// - This operation may block forever if no receiver is present
+    /// - The message registers are consumed by the operation
+    /// - Capability references become invalid after the send
+    /// 
+    /// # Arguments
+    /// 
+    /// * `endpoint` - The endpoint to send to
+    /// * `message` - Message to send (consumed)
+    fn send(&self, endpoint: &Cap<cap_types::Endpoint>, message: Message) -> Result<(), IPCError>;
+    
+    /// Receive a message from an endpoint
+    /// 
+    /// # Safety
+    /// 
+    /// - This operation may block forever if no sender is present
+    /// - The message is populated with received data
+    /// - Received capability references are only valid during this call
+    /// 
+    /// # Arguments
+    /// 
+    /// * `endpoint` - The endpoint to receive from
+    /// * `message` - Message buffer to populate
+    fn receive(&self, endpoint: &Cap<cap_types::Endpoint>, message: &mut Message) -> Result<(), IPCError>;
+    
+    /// Non-blocking receive attempt
+    /// 
+    /// Returns immediately with an error if no message is available
+    fn try_receive(&self, endpoint: &Cap<cap_types::Endpoint>, message: &mut Message) -> Result<(), IPCError>;
+}
+
+/// Notification operations
+/// 
+/// seL4 notifications provide lightweight, asynchronous signaling.
+/// They are more efficient than endpoints for simple signaling.
+pub trait NotificationOps {
+    /// Signal a notification
+    /// 
+    /// # Safety
+    /// 
+    /// - This operation never blocks
+    /// - Multiple signals may be coalesced by the kernel
+    /// - The notification word is set to a non-zero value
+    fn signal(&self, notif: &Cap<cap_types::Notification>) -> Result<(), NotificationError>;
+    
+    /// Wait for a notification signal
+    /// 
+    /// # Safety
+    /// 
+    /// - This operation blocks until a signal is received
+    /// - The notification word is reset to zero
+    /// - Multiple signals may be coalesced into one wake
+    fn wait(&self, notif: &Cap<cap_types::Notification>) -> Result<u32, NotificationError>;
+    
+    /// Non-blocking wait attempt
+    /// 
+    /// Returns immediately with the current notification word
+    fn poll(&self, notif: &Cap<cap_types::Notification>) -> Result<u32, NotificationError>;
+}
+
+/// Virtual memory space operations
+/// 
+/// These operations manage virtual memory mappings and address spaces.
+/// All operations respect page alignment and access rights.
+pub trait VSpaceOps {
+    /// Map a physical frame into virtual memory
+    /// 
+    /// # Safety
+    /// 
+    /// - `vaddr` must be page-aligned
+    /// - The caller must have write rights on the page directory
+    /// - The frame must not already be mapped at the target address
+    /// - After mapping, the frame is accessible at the virtual address with the specified rights
+    /// 
+    /// # Arguments
+    /// 
+    /// * `pd` - Page directory to map into
+    /// * `frame` - Physical frame to map
+    /// * `vaddr` - Target virtual address (must be page-aligned)
+    /// * `rights` - Access rights for the mapping
+    /// * `cacheable` - Whether the mapping should be cacheable
+    fn map_frame(
+        &self,
+        pd: &Cap<cap_types::PageDirectory>,
+        frame: &Cap<cap_types::Frame>,
+        vaddr: VirtAddr,
+        rights: rights::Rwx<rights::Read, rights::Write, rights::Execute>,
+        cacheable: bool,
+    ) -> Result<(), VSpaceError>;
+    
+    /// Unmap a virtual memory page
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on the page directory
+    /// - After unmap, the virtual address becomes inaccessible
+    /// - Any cached data for the page is invalidated
+    fn unmap(&self, pd: &Cap<cap_types::PageDirectory>, vaddr: VirtAddr) -> Result<(), VSpaceError>;
+    
+    /// Change page table mappings
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on both page directories
+    /// - This operation affects all threads using the address space
+    fn switch_vspace(&self, new_pd: &Cap<cap_types::PageDirectory>) -> Result<(), VSpaceError>;
+}
+
+/// Thread control operations
+/// 
+/// These operations manage thread creation, configuration, and execution.
+/// All operations respect the capability-based access control model.
+pub trait ThreadOps {
+    /// Configure a thread's execution context
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on the TCB
+    /// - The CSpace and VSpace capabilities must be valid
+    /// - The entry point must be a valid instruction address
+    /// - After configuration, the thread is ready to run but not started
+    /// 
+    /// # Arguments
+    /// 
+    /// * `tcb` - Thread control block to configure
+    /// * `cspace_root` - CSpace root capability
+    /// * `vspace_root` - VSpace root capability
+    /// * `entry_point` - Thread entry point address
+    /// * `stack_top` - Top of the thread's stack
+    fn configure(
+        &self,
+        tcb: &Cap<cap_types::TCB>,
+        cspace_root: &Cap<cap_types::CNode>,
+        vspace_root: &Cap<cap_types::PageDirectory>,
+        entry_point: VirtAddr,
+        stack_top: VirtAddr,
+    ) -> Result<(), ThreadError>;
+    
+    /// Start or resume a thread
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on the TCB
+    /// - The thread must be properly configured
+    /// - After resume, the thread begins executing at its entry point
+    fn resume(&self, tcb: &Cap<cap_types::TCB>) -> Result<(), ThreadError>;
+    
+    /// Suspend a thread
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on the TCB
+    /// - After suspend, the thread stops executing but retains its state
+    fn suspend(&self, tcb: &Cap<cap_types::TCB>) -> Result<(), ThreadError>;
+    
+    /// Set thread priority
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have write rights on the TCB
+    /// - Priority must be within valid range (0-255)
+    fn set_priority(&self, tcb: &Cap<cap_types::TCB>, priority: u8) -> Result<(), ThreadError>;
+}
+
+/// Interrupt handling operations
+/// 
+/// These operations manage interrupt routing and acknowledgment.
+/// All operations require special IRQ control capabilities.
+pub trait IRQOps {
+    /// Acknowledge an interrupt
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have the IRQ control capability
+    /// - This operation must be called after handling the interrupt
+    /// - After acknowledgment, the interrupt can be triggered again
+    fn ack(&self, irq: &Cap<cap_types::IRQControl>, irq_number: u32) -> Result<(), IRQError>;
+    
+    /// Set interrupt handler
+    /// 
+    /// # Safety
+    /// 
+    /// - The caller must have the IRQ control capability
+    /// - The notification capability must be valid
+    /// - After setting, the interrupt will signal the notification when triggered
+    fn set_handler(
+        &self,
+        irq: &Cap<cap_types::IRQControl>,
+        irq_number: u32,
+        notification: &Cap<cap_types::Notification>,
+    ) -> Result<(), IRQError>;
+}
+
+// =============================================================================
+// BOOT-TIME SERVICES
+// =============================================================================
+
+/// Boot-time information and initial capabilities
+/// 
+/// This trait provides safe access to the seL4 boot information structure.
+/// The root task uses this to obtain the initial capability set.
+pub trait BootInfo {
+    /// Get the root CNode capability
+    /// 
+    /// # Safety
+    /// 
+    /// - This is the root of the capability space
+    /// - All other capabilities are derived from this
+    fn root_cnode(&self) -> &Cap<cap_types::CNode>;
+    
+    /// Get the initial thread's TCB capability
+    /// 
+    /// # Safety
+    /// 
+    /// - This is the TCB of the currently executing thread
+    /// - It can be used to configure the initial thread
+    fn init_thread_tcb(&self) -> &Cap<cap_types::TCB>;
+    
+    /// Get the initial VSpace capability
+    /// 
+    /// # Safety
+    /// 
+    /// - This is the virtual address space of the initial thread
+    /// - It contains the kernel mappings and initial user mappings
+    fn init_vspace(&self) -> &Cap<cap_types::PageDirectory>;
+    
+    /// Get the list of untyped memory regions
+    /// 
+    /// # Safety
+    /// 
+    /// - These are the raw memory regions available for retyping
+    /// - Each region can be retyped into specific kernel objects
+    fn untyped_regions(&self) -> &[UntypedRegion];
+    
+    /// Get the number of available CPU cores
+    fn num_cores(&self) -> usize;
+    
+    /// Get the seL4 version information
+    fn sel4_version(&self) -> (u32, u32, u32); // major, minor, patch
+}
+
+/// An untyped memory region from boot info
+#[derive(Debug, Clone)]
+pub struct UntypedRegion {
+    /// Physical address of the region
+    pub paddr: PhysAddr,
+    /// Size of the region in bytes (must be power of 2)
+    pub size: usize,
+    /// Whether this region is device memory
+    pub is_device: bool,
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapError {
+    /// Insufficient capability rights
+    InsufficientRights,
+    /// Invalid capability
+    InvalidCap,
+    /// Capability slot already occupied
+    SlotOccupied,
+    /// Insufficient untyped memory
+    InsufficientMemory,
+    /// Invalid object type
+    InvalidType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IPCError {
+    /// Message too large for registers
+    MessageTooLarge,
+    /// Invalid capability reference
+    InvalidCapRef,
+    /// No message available (for non-blocking operations)
+    NoMessage,
+    /// Endpoint not found
+    EndpointNotFound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationError {
+    /// Invalid notification capability
+    InvalidNotification,
+    /// Notification already signaled
+    AlreadySignaled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VSpaceError {
+    /// Invalid virtual address (not page-aligned)
+    InvalidAddress,
+    /// Page already mapped
+    AlreadyMapped,
+    /// Invalid page directory
+    InvalidPageDir,
+    /// Insufficient rights
+    InsufficientRights,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadError {
+    /// Invalid TCB
+    InvalidTCB,
+    /// Thread already running
+    AlreadyRunning,
+    /// Invalid entry point
+    InvalidEntryPoint,
+    /// Invalid stack pointer
+    InvalidStack,
+    /// Insufficient rights
+    InsufficientRights,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IRQError {
+    /// Invalid IRQ number
+    InvalidIRQ,
+    /// IRQ not configured
+    NotConfigured,
+    /// Invalid notification capability
+    InvalidNotification,
+}
+
+// =============================================================================
+// INTEGRATION NOTES
+// =============================================================================
+
+/*
+# Integration with Loop's Capability Broker
+
+This `core.ril` specification provides the low-level seL4 capability primitives
+that form the foundation of Loop OS's security model. The higher-level
+Capability Broker (defined in `cap_broker.proto`) is built on top of these
+primitives:
+
+1. **Broker Compartment**: The Capability Broker runs as a seL4 process with
+   orchestrate capabilities, using `core.ril` to manage its own compartments.
+
+2. **Capability Transport**: The broker's `CapToken` messages are transported
+   using seL4 IPC endpoints and notifications defined in this specification.
+
+3. **Resource Enforcement**: When the broker mediates access to resources,
+   it uses `core.ril` operations to:
+   - Map/unmap memory frames for file access
+   - Configure network endpoints for IPC
+   - Manage device capabilities for hardware access
+   - Control thread execution for app launching
+
+4. **Isolation**: Each application compartment is a separate seL4 process
+   with its own CSpace and VSpace, enforced by the kernel primitives in
+   this specification.
+
+The broker never exposes raw seL4 capabilities to applications; instead,
+it provides its own capability tokens that are mediated through the
+secure interfaces defined here.
+
+# Implementation Guidelines
+
+When implementing this specification:
+
+1. **All unsafe code is encapsulated** - public APIs are safe
+2. **Capability handles never escape** - use zero-sized types
+3. **Type safety is enforced** - access rights are encoded in types
+4. **Memory safety is preserved** - no use-after-free or double-free
+5. **Formal verification is maintained** - don't break seL4's guarantees
+
+This specification is intentionally minimal but complete - it provides
+all necessary primitives while preventing common capability-based errors.
+*/
