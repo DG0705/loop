@@ -1,0 +1,1 @@
+{"rustc":6313536168557467772,"features":"[\"mock\"]","declared_features":"[\"mock\"]","target":6308419079131071360,"profile":8731458305071235362,"path":8204889261794057632,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug\\.fingerprint\\loop-core-0bd4925603808ea9\\dep-lib-loop_core","checksum":false}}],"rustflags":[],"config":8247474407144887393,"compile_kind":0}

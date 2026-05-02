@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "loop-core",
+    "test-hello",
+    "test-broker",
+    "test-aura",
+    "test-shell",
+    "test-boot",
+    "compartments/root_task",
+    "compartments/broker",
+    "compartments/shell",
+    "compartments/aura",
+]
+
+[profile.release]
+opt-level = 2
+lto = true
